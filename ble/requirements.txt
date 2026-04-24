@@ -1,3 +1,5 @@
 winrt-Windows.Devices.Bluetooth.GenericAttributeProfile>=2.0,<4
 winrt-Windows.Devices.Bluetooth>=2.0,<4
 winrt-Windows.Storage.Streams>=2.0,<4
+# Required when awaiting notify_value_async (result is IVectorView / collections projection)
+winrt-Windows.Foundation.Collections>=2.0,<4
