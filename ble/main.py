@@ -22,13 +22,19 @@ from typing import Callable, Optional
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
-from winrt.windows.devices.bluetooth import BluetoothError
+from winrt.windows.devices.bluetooth import (
+    BluetoothConnectionStatus,
+    BluetoothError,
+    BluetoothLEDevice,
+)
 from winrt.windows.devices.bluetooth.genericattributeprofile import (
     GattCharacteristicProperties,
     GattLocalCharacteristicParameters,
     GattProtectionLevel,
     GattServiceProvider,
     GattServiceProviderAdvertisingParameters,
+    GattSession,
+    GattWriteOption,
 )
 from winrt.windows.storage.streams import DataReader, DataWriter
 
@@ -70,10 +76,30 @@ def _sinc_stream_bytes() -> bytes:
     return b"".join(_sinc_payloads())
 
 
-def _chunk_preview(chunk: bytes) -> str:
+def _chunk_preview(chunk: bytes) -> tuple[str, str]:
     hex_spaced = " ".join(f"{b:02x}" for b in chunk)
     ascii_safe = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
     return hex_spaced, ascii_safe
+
+
+def _rx_bytes_log_lines(raw: bytes, *, offset: int, write_option: GattWriteOption) -> list[str]:
+    """Human-readable RX lines (NUS RX is usually raw UTF-8 bytes, not WinRT WriteString format)."""
+    opt_name = write_option.name if isinstance(write_option, GattWriteOption) else repr(write_option)
+    if not raw:
+        return [f"RX [NUS]: len=0 offset={offset} option={opt_name} (empty payload)"]
+
+    hex_spaced, ascii_safe = _chunk_preview(raw)
+    lines = [
+        f"RX [NUS]: len={len(raw)} offset={offset} option={opt_name}",
+        f"RX [NUS]: hex=[{hex_spaced}]",
+        f"RX [NUS]: ascii_preview=[{ascii_safe}]",
+    ]
+    try:
+        text = raw.decode("utf-8")
+        lines.append(f"RX [NUS]: utf8={text!r}")
+    except UnicodeDecodeError:
+        lines.append("RX [NUS]: utf8=(not valid UTF-8)")
+    return lines
 
 
 class NusBleServer:
@@ -84,6 +110,9 @@ class NusBleServer:
         self._log = log
         self._provider: Optional[GattServiceProvider] = None
         self._tx = None
+        # BluetoothLEDevice.from_id_async + ConnectionStatusChanged (GattSession status often stays silent).
+        self._tracked_le_device_ids: set[str] = set()
+        self._le_devices: dict[str, BluetoothLEDevice] = {}
 
     @property
     def is_running(self) -> bool:
@@ -92,22 +121,120 @@ class NusBleServer:
     def _schedule_rx(self, _sender, args) -> None:
         asyncio.run_coroutine_threadsafe(self._handle_rx_write(args), self._loop)
 
+    def _schedule_le_connection_monitor(self, session: GattSession) -> None:
+        """Resolve central to BluetoothLEDevice and log ConnectionStatusChanged (runs on BLE asyncio loop)."""
+        try:
+            dev_id = session.device_id
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"BLE link monitor: no device_id on GattSession: {exc!r}")
+            return
+        asyncio.run_coroutine_threadsafe(self._track_le_device_connection_async(dev_id), self._loop)
+
+    async def _track_le_device_connection_async(self, device_id) -> None:
+        """Subscribe to BluetoothLEDevice.ConnectionStatusChanged for this central."""
+        try:
+            id_str = device_id.id
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"BLE link monitor: invalid device_id: {exc!r}")
+            return
+
+        if id_str in self._tracked_le_device_ids:
+            return
+
+        try:
+            le = await BluetoothLEDevice.from_id_async(id_str)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"BLE link monitor: BluetoothLEDevice.from_id_async failed id={id_str!r}: {exc!r}")
+            return
+
+        if le is None:
+            self._log(f"BLE link monitor: BluetoothLEDevice.from_id_async returned null id={id_str!r}")
+            return
+
+        def on_connection_status_changed(device: BluetoothLEDevice, _o: object) -> None:
+            try:
+                did = device.device_id
+                st = device.connection_status
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"BLE link monitor: status callback error: {exc!r}")
+                return
+            try:
+                name = device.name or ""
+            except Exception:
+                name = ""
+            try:
+                addr = int(device.bluetooth_address)
+                addr_hex = f"{addr:#018x}"
+            except Exception:
+                addr_hex = "?"
+            if st == BluetoothConnectionStatus.CONNECTED:
+                self._log(
+                    f"BLE connected: device_id={did!r} name={name!r} address={addr_hex} "
+                    f"connection_status={st.name}"
+                )
+            elif st == BluetoothConnectionStatus.DISCONNECTED:
+                self._log(
+                    f"BLE disconnected: device_id={did!r} name={name!r} address={addr_hex} "
+                    f"connection_status={st.name}"
+                )
+            else:
+                self._log(f"BLE connection status: device_id={did!r} status={st!r}")
+
+        try:
+            le.add_connection_status_changed(on_connection_status_changed)
+            self._tracked_le_device_ids.add(id_str)
+            self._le_devices[id_str] = le
+            cur = le.connection_status
+            nm = le.name or ""
+            addr = int(le.bluetooth_address)
+            self._log(
+                f"BLE link monitor started: device_id={id_str!r} name={nm!r} address={addr:#018x} "
+                f"initial_connection_status={cur.name}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"BLE link monitor: add_connection_status_changed failed id={id_str!r}: {exc!r}")
+
+    def _track_sessions_from_tx_subscribers(self) -> None:
+        if not self._tx:
+            return
+        try:
+            for client in self._tx.subscribed_clients:
+                self._schedule_le_connection_monitor(client.session)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"TX subscribed_clients link monitor error: {exc!r}")
+
     async def _handle_rx_write(self, args) -> None:
         deferral = args.get_deferral()
         try:
+            try:
+                self._schedule_le_connection_monitor(args.session)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"RX: could not schedule BLE link monitor: {exc!r}")
+
             request = await args.get_request_async()
+            offset = int(request.offset)
+            write_opt = request.option
+
             reader = DataReader.from_buffer(request.value)
             n = int(reader.unconsumed_buffer_length)
-            received = reader.read_string(n) if n else ""
-            self._log(f"RX: {received}")
+            if n <= 0:
+                raw = b""
+            else:
+                buf = bytearray(n)
+                reader.read_bytes(buf)
+                raw = bytes(buf)
+
+            for line in _rx_bytes_log_lines(raw, offset=offset, write_option=write_opt):
+                self._log(line)
             request.respond()
         except Exception as exc:  # noqa: BLE001 — surface to log; still complete deferral
-            self._log(f"RX error: {exc}")
+            self._log(f"RX [NUS] error: {exc!r}\n{traceback.format_exc()}")
         finally:
             deferral.complete()
 
     def _on_tx_subscribed(self, _sender, _e) -> None:
         self._log("Client subscribed to TX")
+        self._track_sessions_from_tx_subscribers()
 
     async def start(self) -> bool:
         if self._provider is not None:
@@ -163,6 +290,13 @@ class NusBleServer:
             self._log("Advertising stopped.")
         self._provider = None
         self._tx = None
+        for le in list(self._le_devices.values()):
+            try:
+                le.close()
+            except Exception:
+                pass
+        self._le_devices.clear()
+        self._tracked_le_device_ids.clear()
 
     async def send_chunked(
         self,
