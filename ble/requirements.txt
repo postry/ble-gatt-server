@@ -1,5 +1,9 @@
-winrt-Windows.Devices.Bluetooth.GenericAttributeProfile>=2.0,<4
-winrt-Windows.Devices.Bluetooth>=2.0,<4
-winrt-Windows.Storage.Streams>=2.0,<4
+# Windows: WinRT GATT peripheral
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile>=2.0,<4; sys_platform == "win32"
+winrt-Windows.Devices.Bluetooth>=2.0,<4; sys_platform == "win32"
+winrt-Windows.Storage.Streams>=2.0,<4; sys_platform == "win32"
 # Required when awaiting notify_value_async (result is IVectorView / collections projection)
-winrt-Windows.Foundation.Collections>=2.0,<4
+winrt-Windows.Foundation.Collections>=2.0,<4; sys_platform == "win32"
+
+# Linux / macOS: Bless (BlueZ / Core Bluetooth)
+bless>=0.2.0; sys_platform != "win32"
